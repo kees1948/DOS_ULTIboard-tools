@@ -3,7 +3,7 @@
 Breathe new life into this very nice software package from the 90's. UTIBoard and ULTICap are very capable tools
 for Schematic entry and PCB design. I use it still as of today with pleasure.
 
-If you still have a ULTIBOARD version for DOS, WITH THE DONGLE and the license file, you can still successfuly 
+If you still have a ULTIBOARD version for DOS, WITH THE DONGLE and the license file (lic100.pwd), you can still successfuly 
 use it today. (Warning: using dosbox with ULTIboard on Windows is dangerous, we have experienced multiple events where 
 the DONGLE was DAMAGED beyond further use. This NEVER happened with the Linux version (this dosbox version)
 
