@@ -1,0 +1,1017 @@
+#!/usr/bin/perl 
+# -w
+
+#
+# translate a RS274D dataset into RS274X
+# to be called IN the <project>/PCBS  directory
+#
+# MOVE the gerber plots to the same coordinates as the drill file!!!!!
+#
+# MANDATORY is: the offset is calculated by finding the largest X offset first
+# and with that offset the largest Y offset.
+# That target hole SHOULD BE a round hole!!! If neccesary place a dummy hole (component) 
+# or VIA on the furthest X/Y coordinate to compensate.
+#
+
+# usage d274tox274 -p <name_of_pls> -f <gerber_file_basename in 274D format>
+# i.e.
+# d274tox274 -d RS274D_2.PLS -f MY_PROJ
+#
+# all options MUST be honored
+#
+# G90  set coordinate format to absolute    # FS
+# G91  set coordinate format to incremental # FS
+# G54  select aperture      #OLD
+# G55  prepare for flash    #OLD
+# G70  set units to inch  ## MO
+# G71  set units to mm    ## MO
+# M00  program stop         ## M02
+# M01  optional stop        #OLD
+# IP   set image polarity   #  %IPPPOS*%  [1]
+# AS   axes correspondance  #  MI, SF, IR, AS
+# IR   image rotation       #
+# MI   image mirroring
+# OF   image offset
+# SF   scale factor
+# IN   name of image        #OLD
+# LN                        #OLD
+
+	require "getopts.pl";
+	use DateTime;
+#
+# where the .PLS files are to be found
+#
+    $ultiboard_base = "xltimate";
+    $gerberpath = "./gerbers/";
+
+#
+    $homedir = $ENV{HOME};    
+	$ultiboard = sprintf "%s/%s", $homedir, $ultiboard_base;
+
+    my $dt   = DateTime->now;                                           # Stores current date and time as datetime object
+    my $date = $dt->ymd;                                                # Retrieves date as a string in 'yyyy-mm-dd' format
+    my $time = $dt->hms;                                                # Retrieves time as a string in 'hh:mm:ss' format
+    
+#
+# command line options
+#
+    $opt_p = "RS274D_2.PLS";                                            # default .PLS file
+    $opt_f = "";
+    $opt_d = 0;                                                         # debug
+#
+    $dcodetype = "C";                                                   # circle
+    my %d274dcodes;
+
+#
+# desired output format GERBER (and EXCELLON) always.....
+#
+    $f_integers = 2;					                # default for INCH
+    $f_decimals = 3;					                # idem
+# offset values
+    $xoffset_gerber = 0;                                                # gerber plots are moved left and down
+    $yoffset_gerber = 0;
+#
+    $xoffset_vector = 0;                                                # as used in ProcessVectorLine
+    $yoffset_vector = 0;
+#
+    $xoffset_max = 0.0;
+    $yoffset_max = 0.0;
+#
+# 	defaults by Ultipost , excellon, updated while processing .REP file
+#
+    $e_integers;
+    $e_decimal;
+    $e_drillunits = "INCH";
+    $e_expanded = "1";
+    $e_leadingzeros = "1";
+    $e_startstring = "\%";
+    $e_endstring = "M00";
+#
+# INCH	IS preset in Ultipost for GERBER input files <file>.GX
+#
+    $i_integers = 2;
+    $i_decimals = 3;
+    $i_gerberunits = "INCH";
+#    
+    my $formatunits = "\%MOIN\*\%";		                                # use inch measures!
+    my $f_rotation = 0.0;
+    my $f_leadingzeros = 'L';                                           # trailing zeros = 'T'
+    my $f_notation = 'A';                                               # absolute or incremental 'I'
+    my $formatspec = "\%FS".$f_leadingzeros.$f_notation."X".$f_integers.$f_decimals."Y".$f_integers.$f_decimals."\*\%";
+    my $index;
+#
+# globals
+#
+    
+# .PLS file flags
+	@plsregels;
+	$ecn_value;
+	$bol_value;
+	$via_value;
+	$pdr_value;
+	$smd_value;
+	$ptp_value;
+	$pbt_value;
+	$sst_value;
+	$sbt_value;
+	$sbb_value;
+	$gst_value;
+	$cnm_value;
+	$cvl_value;
+	$drh_value;
+	$drc_value;
+	$rfl_value;
+	$osz_value;
+	$npl_value;
+	$drf_value;
+
+	%drilltools;
+	$f_drillunits;
+
+    #
+	# signal layer translation -> layers2names
+	#
+    %ublayer2stack = (1, 3, 2, 10, 3, 5, 4, 4, 5, 7, 6, 6, 7, 9, 8, 8);
+
+    #
+	# filename translation
+    # names .G0...G7 are possible SIGNALLAYERS, depending on .PLS file
+    #
+    # result is stack of RS274X files to fit on top of each other
+    # with names that are self-explanatory
+    #
+    # PROJECT_SILK(TOP).GBR             # .G6  [G6]
+    # PROJECT_MASK(TOP).GBR             # .G2  [G2]
+    # PROJECT_SIGNAL(TOP).GBR           # .G0
+    # PROJECT_SIGNAL(BOTTOM).GBR        # .G1
+    # PROJECT_MASK(BOTTOM).GBR          # .G3  [G3]
+    # PROJECT_SILK(BOTTOM).GBR          # .G7  [G7]
+    #
+    # PROJECT_SMD(TOP).GBR              # .G4  [G4]
+    # PROJECT_SMD(BOTTOM).GBR           # .G5  [G5]
+    # PROJECT_DRILLTARGETS.GBR          # .G50
+    #
+    # PROJECT_EXCELLON.DRI              # .D0
+    #
+    # PROJECT_ASSIST(OFFSET).GBR        # (.G8)
+    #
+    # where "PROJECT" is the base name of the design given with the -f commandline option
+    #
+    %layers2names = (1, "topsilk", 2, "topmask", 
+                    3, "top", 
+                    4, "inner1", 5, "inner2", 
+                    6, "inner3", 7, "inner4", 
+                    8, "inner5", 9, "inner6", 
+                    10, "bottom",
+                    11, "bottommask", 12, "bottomsilk", 
+                    13, "topSMD", 14, "bottomSMD", 
+                    15, "Assist",                               # special file for offset calculation
+                    50, "drilltargets");
+
+    #
+    # bits in .PLS file to variable 
+    #
+	%bit2name = (1, ecn_value, 2, bol_value, 4, via_value, 8, pdr_value,
+            16, smd_value, 32, ptp_value, 64, pbt_value, 128, sst_value,
+            256, sbt_value, 512, sbb_value, 1024, gst_value, 2048, cnm_value,
+            4096, cvl_value, 8192, drh_value, 16384, drc_value, 32768, rfl_value,
+            65536, osz_value, 131072, npl_value, 262144, drf_value,
+            );
+    #
+    # idem , the other way around
+    #
+	%name2bit = (ecn_value, 1, bol_value, 2, via_value, 4, pdr_value, 8,
+            smd_value, 16, ptp_value, 32, pbt_value, 64, sst_value, 128,
+            sbt_value, 256, sbb_value, 512, gst_value, 1024, cnm_value, 2048,
+            cvl_value, 4096, drh_value, 8192, drc_value, 16384, rfl_value, 32768,           
+            osz_value, 65536, npl_value, 131072, drf_value, 262144,
+            );
+
+##############################################################################################
+#
+# start of program
+#
+##############################################################################################
+	if ($#ARGV < 0)
+	{
+		print ("usage:  274dto274x  -p <> -f <> \n");
+		print ("-p  < file >    name of PLS file \n");
+		print ("-f  < file >    name of project basename of 274D gerber file\n");
+		print ("                i.e. MYPROJECT  (without the .GX extension)\n");
+		exit(1);
+	}
+	
+	&Getopts('df:p:?');
+	
+	if (($opt_p eq "") || ($opt_f eq ""))
+	{
+		print ("arguments missing, please check!\n");
+		exit (1);
+	}
+	
+#
+# construct report and doc name from filename
+#
+# if -f <filename> is in UPPERCASE then all file references WILL BE uppercase
+# if -f <filename> is in lowercase then all file references WILL BE lowercase
+#
+# Mixed case is NOT SUPPORTED!! will produce unpredictable results
+#
+	if ($opt_f eq uc ($opt_f))
+	{
+		$fileupper = 1;
+	}
+	else
+	{ 
+		$fileupper = 0;
+	}
+#	
+# Process REPORTFILE here, gives valuable info and update variables
+#
+
+# check gerber directory
+	$gerberpath = sprintf "%s", ($fileupper == 1) ? uc $gerberpath : lc $gerberpath;
+	if (!(-e $gerberpath and -d $gerberpath))
+	{
+		mkdir $gerberpath;
+	}
+
+# construct .rep file name in proper case and open it
+	$opt_r = sprintf "%s.%s", $opt_f, ($fileupper == 1) ? "REP" : "rep";
+	open(REPORT, "$opt_r") || die "can't open report file $opt_r !\n";
+
+	&ProcessReportFile;						                            # should provide drill tools and apertures!
+
+    close REPORT;
+  
+    @in_dcodes = sort keys (%d274dcodes);                               # get sorted aperture elements
+#
+# Process ULTIB.SET here, not used
+#
+	#$ultibset = sprintf "%s%s", $ultiboard, ($fileupper == 1) ? "ULTIB.SET" : "ultib.set";
+	#open (ULTIB, $ultibset) || die "Can open settings $ultibset file \n";
+	#&ProcessUltiset;						# miscellaneous settings
+	#close ULTIB;
+
+#   
+# scan the provided .PLS file and build @plsregels array with lines
+#
+	my $plsfile = sprintf "%s/%s", $ultiboard, $opt_p;
+	my $plsline;
+	my $maxlines = 0;
+
+	open (PLSFILE, "$plsfile") || die "can't open PLS file $plsfile !\n";
+		
+	while(<PLSFILE>)	
+	{
+		chomp $_;		
+		$_ =~ s/[\x00-\x1f]//g;  # strip control characters
+		push @plsregels, $_;
+	}
+	close PLSFILE;
+#
+# copy relevant data and do some sanity checks
+#    
+    $pls_version = shift @plsregels;
+    $pls_trailer = pop @plsregels;  
+    if ((scalar @plsregels) != 50)
+    {
+        printf "edit_pls: file has only %d data lines, expect 50...\n",   (scalar @plsregels) ;
+        exit 1;
+    }
+
+#
+# first we need to know the offset of the gerbers, we estimate it by
+# scanning the special (last) .GX file _AND_ the drill file
+# by searching the coordinates with the highest X/Y value in both
+# files. We (can safely) assume that they locate the SAME spot.
+# now we can subtract both max values to learn the offset value
+#
+# look for the 'highest' valid .GX file number in the .PLS file
+#
+    my $lastgindex = -1;
+	for ($index = 0 ; $index < 48 ; $index++)
+	{
+        &ParsePlsArray($index);                                         # parse line
+        if (($plstracelayers == 0) && ($plspadlayers == 0) && ($plsplotdetails == 0)) # we found end of normal list
+		{
+            $lastgindex = $index - 1;                                   # correct loop offset
+			goto DONEPLS0;
+		}        
+    }
+DONEPLS0:
+    # parse the PLS line (again)
+    &ParsePlsArray($lastgindex);                                        # set plsplotdetails
+    #
+    # sanity check
+    # should _only_ have the drill selects set
+    #
+    if (($lastgindex >= 0) && (((hex $plsplotdetails) & 8204) == 8204)) # 8192+8+4 drh+pdr+via
+    {
+		&CalculateOffset($lastgindex);                                  # special trick!!!
+    }
+    else
+    {
+        print "WARNING: Can't find proper Offset_Info_Gerber_file!!\n";
+    }
+
+#
+# it as assumed that the .PLS file has the SIGNAL layers FIRST and the rest thereafter!!
+# the LAST padlayer file is special, it should _only_ reference drilled holes!!!!
+#
+# process pls info, first signal layers
+# assume that signal layers come first, for 2 layer: 0 and 1, for 4 layer 0, 1, 2, 3
+# for 8 layer 0, 1, 2, 3, 4, 5, 6, 7
+#
+	for ($index = 0 ; $index < 48 ; $index++)
+	{
+		&ParsePlsArray($index);		                                    # fill in items
+		if ($plstracelayers == 0)	
+		{
+			goto DONEPLS1;
+		}
+		$gerberin = sprintf "%s.%s%d", $opt_f, ($fileupper == 1) ? "G" : "g", $index;
+		#
+        $outhint = &GuessName;
+		$gerberout= sprintf "%s/%s_%s.%s", $gerberpath, $opt_f, ($fileupper == 1) ? uc $outhint : lc $outhint,
+		($fileupper == 1) ? "GBR" : "gbr"; 
+
+		&DoOneFile;
+	}
+DONEPLS1:
+#
+# now process additional plots, name them appropriate
+# masks, stencils, silk, etc
+#
+	for ( ; $index < 48 ; $index++)
+	{
+		&ParsePlsArray($index);		                                    # fill in items
+		if(($plsplotdetails eq "0") && ($plspadlayers == 0))
+		{
+			goto DONEPLS2;
+		}
+		$gerberin = sprintf "%s.%s%d", $opt_f, ($fileupper == 1) ? "G" : "g", $index;
+		#
+        $outhint = &GuessName;
+		# do not process 'Assist file"
+		if (index ($outhint , "unknown") != 0)
+		{
+			$gerberout= sprintf "%s/%s_%s.%s", $gerberpath, $opt_f, ($fileupper == 1) ? uc $outhint : lc $outhint, 
+			($fileupper == 1) ? "GBR" : "gbr"; 
+			&DoOneFile;
+		}
+	}
+DONEPLS2:
+#
+# the last pls selection returned empty, thus end of list
+# drill targets, may need extra info about tools
+#
+	$index = 50;	                                                    # select drill plan
+	$gerberin = sprintf "%s.%s%d", $opt_f, ($fileupper == 1) ? "G" : "g", $index;
+    #
+	$outhint = $layers2names{$index};
+	$gerberout= sprintf "%s/%s_%s.%s", $gerberpath, $opt_f, ($fileupper == 1) ? uc $outhint : lc $outhint, 
+	($fileupper == 1) ? "GBR" : "gbr"; 
+
+	&DoOneFile;
+#
+# Process the excellon drill file
+#
+	$gerberin = sprintf "%s.%s", $opt_f, ($fileupper == 1) ? "D0" : "d0";
+    #
+	$outhint = "EXCELLON";
+	$gerberout= sprintf "%s/%s_%s.%s", $gerberpath, $opt_f, ($fileupper == 1) ? $outhint : lc $outhint, 
+	($fileupper == 1) ? "DRI" : "dri"; 
+    # the output format is ALWAYS NNNDDD vectors
+    
+	open(INPUT,  "$gerberin") || die "can't open gerber file $gerberin !\n";
+	open(OUTPUT, ">$gerberout") || die "can't open output file $gerberout !\n";
+	&DoExcellon;
+   	close INPUT;
+   	close OUTPUT;
+#
+	print"Done!\n";
+
+#
+#  END ===========
+#
+
+##############################################################################################
+#
+# process one gerber file
+#
+##############################################################################################
+sub DoOneFile
+{
+    my $regel;
+    my $flag;
+
+    open(INPUT,  "$gerberin") || die "can't open gerber file $gerberin !\n";
+
+    <INPUT>;                                                            # read one line
+    if (index($_, "G04") >= 0)
+    {
+        die "input gerber appears to be already in 274X format!\n";
+    }
+    seek (INPUT, 0, 0);
+
+    open(OUTPUT, ">$gerberout") || die "can't open output file $gerberout !\n";
+	
+#
+# write out default header information
+#
+    print OUTPUT "G4 d274tox274  Date: $date $time \*\n";
+    print OUTPUT "G4 Design File: $opt_f \*\n";
+    print OUTPUT "G4 Layer name: $outhint \*\n";
+    print OUTPUT "G4 Scale: 100 percent, Rotated: No, Reflected: No \*\n";
+    print OUTPUT $formatspec."\n";
+    print OUTPUT $formatunits."\n";
+    print OUTPUT "\%LN".$opt_lu."\*\%\n";
+
+    # apertures list
+    my $formathelp = "\%AD";
+    for my $dc (@in_dcodes) 
+    {
+        my $dval = substr($dc,1) * 1.0;
+        $dchelp = sprintf "D%d", $dval;
+        printf OUTPUT "%s%s%s,%.3f\*\%\n", $formathelp, $dchelp, $dcodetype, $d274dcodes{$dc} * 0.001;
+    }
+      
+    $xoffset_vector = $xoffset_gerber;
+    $yoffset_vector = $yoffset_gerber;
+      
+    while(<INPUT>)
+    {
+        chomp;
+	$_ =~ s/[\x00-\x1f]//g;                                         # strip control characters
+        
+	$regel = &ProcessVectorLine($_, 1.0, 0);                        # line, factor, flag
+        print OUTPUT $regel."\n";
+    }
+    
+    close INPUT;
+    close OUTPUT;
+} 
+   
+##############################################################################################
+#
+# process one Dcode line, translate VECTORS only
+# value, scale, flag
+#
+##############################################################################################
+sub ProcessVectorLine ()
+{
+    my $line = $_[0];
+    my $scalefactor = $_[1];
+    my $flag = $_[2];
+    # scale factor
+    my %dec2val = (-3, 0.001, -2, 0.01, -1, 0.1, 0, 1, 1, 10, 2, 100, 3, 1000, 4, 10000, 5, 100000, 6, 1000000);
+    my $xinteger;
+    my $xdecimal;
+    my $yinteger;
+    my $ydecimal;
+    my $xoffset = -1;
+    my $yoffset = -1;
+    my $format = sprintf "%s%s%d.%d%s", "%", "0", $f_integers+$f_decimals+1, $f_decimals, "f";
+	my $calcvaly = 0;
+	my $calcvalx = 0;
+	my $flasmode = 0;
+	my $flashx_mx;
+	my $flashx_mn;
+	my $flashy_mx;
+	my $flashy_mn;
+
+
+		if (index ($line, "D01",0) >= 0)
+		{
+			$flashmode = 1;
+			$flashx_mx = $flashx_mn = $flashy_mx = $flashy_mn = -1;
+
+		}
+		elsif ((index ($line , "D02", 0) >= 0) || (index ($line, "M00", 0) >= 0))
+		{
+			$flashmode = 0;
+
+
+		}
+
+
+        if (($xoffset = index ($line, "X" , 0)) >= 0)
+        {
+            $xinteger = substr($line, $xoffset+1, $i_integers);
+            $xdecimal = substr ($line, $xoffset+1+$i_integers, $i_decimals);
+            $xdecimal = $xdecimal * $dec2val{$f_decimals-$i_decimals};
+			$calcvalx =  $xinteger/$scalefactor +  $xdecimal/$scalefactor/1000;
+			if ($flashmode == 1)
+			{
+
+
+			}
+            if (($flag == 1) && ($calcvalx > $xoffset_max))
+            {
+                $xoffset_max = $calcvalx;
+            }
+            $calcvalx += $xoffset_vector;
+			$xoutstring = sprintf "$format",  $calcvalx;
+			$xoutstring =~ s/\.//;
+            substr($line,$xoffset+1, $i_integers+$i_decimals) = $xoutstring;
+        }
+        if (($yoffset = index ($line, "Y")) >= 0)
+        {
+            $yinteger = substr($line, $yoffset+1, $i_integers);
+            $ydecimal = substr ($line, $yoffset+1+$i_integers, $i_decimals);
+            $ydecimal = $ydecimal * $dec2val{$f_decimals-$i_decimals};
+			$calcvaly =  $yinteger/$scalefactor +  $ydecimal/$scalefactor/1000;
+            if (($flag == 2) && ($calcvaly > $yoffset_max) && ($calcvalx == $xoffset_max))
+            {
+                $yoffset_max = $calcvaly;
+            }
+            $calcvaly += $yoffset_vector;
+			$youtstring = sprintf "$format",  $calcvaly;
+			$youtstring =~ s/\.//;            
+            substr($line,$yoffset+1, $i_integers+$i_decimals) = $youtstring;
+        }
+		return $line;
+}
+
+##############################################################################################
+#
+# Process ReportFile, fetch drill tools!, check if aperture list is present!
+#
+##############################################################################################
+sub ProcessReportFile
+{
+    my $found = 0;
+    my @words;
+    my $size;
+    my $munits;
+    my $iunits;
+        
+    #
+    # first look for drill info
+    #
+	while(<REPORT>)
+	{
+        chomp;
+        $_ =~ s/\s+/ /g;
+		
+		if (index($_, "*** EXCELLON DRILL FILE GENERATION ***") >= 0)
+		{
+			goto REPORTDRILL;
+		}
+	}
+	die "FATAL: Reportfile $opt_r is missing drill info, can't resolve drilltools\n";
+
+    #
+    # found drill info marker, now retrieve information
+    # note that multiple whitespace is changed into single whitespace!!
+    #
+REPORTDRILL:
+	while(<REPORT>)
+	{
+        chomp;
+		$_ =~ s/[\x00-\x1f]//g;  # strip control characters
+        $_ =~ s/\s+/ /g;		# collapse whitespace
+	
+        #
+        # we arrived at the "     Tool       Diam      Holes" line 
+        # so we should had all other items
+        #
+		if (index($_, " Tool Diam Holes") == 0)
+		{		
+			goto REPORTDRILL2;
+		}
+		else
+		{
+			if(index($_, "Coord") == 0)                                 # NNNDDD spec of drill coordinates in .D0 file
+			{
+				$e_coordformat = substr($_, 15);
+			}	
+			if (index($_, "Units") == 0)                                # the units for .D0
+			{
+				$e_drillunits = substr($_, 8);
+			}
+			if(index($_, "Leading") == 0)                               # Leading zero's
+			{
+				$e_leadingzeros = substr($_,17);
+			}
+			if(index($_, "Expanded") == 0)                              # Expanded mode
+			{
+				$e_expanded = substr($_,16);
+			}
+			if(index($_, "Start") == 0)                                 # Start string
+			{
+				$e_startstring = substr($_,15);
+			}
+			if(index($_, "End") == 0)                                   # End string
+			{
+				$e_endstring = substr($_,13);
+			}		
+		}
+	}
+	die "FATAL: Reportfile: $opt_r, can't locate tools header\n";       # we are missing stuff here.....
+
+    #
+    # parse the NNNDDD format
+    #
+REPORTDRILL2:
+# translate coord format in $i_integers, $i_decimals
+	$e_integers = 0;
+	$e_decimals = 0;
+	for ($i = 0 ; $i < length $e_coordformat; $i++)
+	{
+		if(substr($e_coordformat,$i,1) eq "N")
+		{
+			$e_integers++;
+		}
+		elsif(substr($e_coordformat,$i,1) eq "D")
+		{
+			$e_decimals++;
+		}
+	}
+
+#
+# parse tool table
+#
+	while(<REPORT>)
+	{
+        chomp;
+        $_ =~ s/\s+/ /g;
+		
+		@words = split (/\s/);
+
+		if ((length $_) <= 1)		                                    # end of tool table
+		{
+			goto REPORTDRILL3;
+		}
+		else
+		{ 
+			if ($iunits = index( $words[2],"\"") >= 0)
+			{
+				$size = substr($words[2], 0, length $words[2]-$iunits);
+			}
+			else
+			{
+				$size = $words[2];
+			}
+			$drilltools{$words[1]} = $size;
+		}
+	}
+#
+# now we scan the .REP file for the aperture list(s), first locate start 
+#
+REPORTDRILL3:
+	seek (REPORT, 0, 0);		                                        # rewind
+    while (<REPORT>)
+    {
+		chomp;
+   		@words = split(/ /, $_);
+            
+        if (index ($words[1], "------------------------") >= 0)
+        {
+            goto REPORTAPERTURES;
+        }
+	}
+	die "FATAL: No apertures found in $opt_r, can't resolve D-codes\n";
+#
+# we process (possibly) 2 D-code tables, but that doesn't matter
+# we construct ONE hash array with D-code and mill-size
+#
+REPORTAPERTURES:
+	while (<REPORT>)
+	{
+        chomp;
+        $_ =~ s/\s+/ /g;
+   		@words = split(/ /, $_);
+
+        if (index ($words[1], "D") < 0)                                 # done with file
+        {
+            goto ENDREPORT;
+        }
+        $d274dcodes{$words[1]} = $words[2];                             # w[1] is Dcode, w[2] is size in mill
+    }
+    ENDREPORT:                
+}
+            
+##############################################################################################
+#
+# remove dups from array
+#
+##############################################################################################
+sub uniq {
+    my %seen;
+    grep !$seen{$_}++, @_;
+}
+
+##############################################################################################
+#
+#  Parse the @plsregels array, by line
+#
+# fill in the form, $index = global
+# in plsplotdetails we recognize the following important info
+#  via_value, pdr_value, smd_value, sst_value, sbt_value, sbb_value, gst_value, rfl_value,
+#  rfl_value, xxxx  are discouraged by PCB foundry WARNING!
+#  items[0] and items[1] should be identical WARNING!
+# 
+##############################################################################################
+sub ParsePlsArray()
+{
+    my $index = $_[0];
+    my  $line = $plsregels[$index];
+    $line =~ s/\#//g;  # strip control characters    
+    $line =~ s/\;//g;  # strip control characters
+    my @items = split (/,/, $line);
+
+    $plstracelayers = $items[0];
+    $plspadlayers 	= $items[1];
+    $plsplotdetails = $items[2];
+    $plsoversize 	= $items[3];
+# check for warnings
+	if (($items[0] != 0) && ($items[1] != 0) && ($items[0] != $items[1]))
+	{
+		printf STDERR "WARNING: padlayer select does not match tracelayer select!\n";
+	}
+	&items2vars($items[2]);
+	if($rfl_value == 1)
+	{
+		printf STDERR "WARNING: reflected image, is this what you want?\n";
+	}
+}
+ 
+##############################################################################################
+#
+# update form variables, convert .PLS line bitfield into separate flags
+#
+##############################################################################################
+sub items2vars()
+{
+    my $decimalvalue = hex ($_[0]);
+    my $vname;
+    
+    for ($v = 1; $v < 524288  ; $v *= 2)
+    {
+        if ($decimalvalue & $v)
+        {
+            $vval = 1;
+        }
+        else
+        {
+            $vval  = 0;
+        }
+        $vname = $bit2name{$v};
+        $$vname = $vval;
+    }
+}
+
+##############################################################################################
+#
+# come up with a plausible filename with hints about the contents
+#
+# 	%layers2names = (1, "silk(top)", 2, "mask(top pad/via/smd)", 3, "signal(top)", 4, "signal(inner1)",
+#			5, "signal(inner2)", 6, "signal(inner3)", 7, "signal(inner4)", 8, "signal(inner5)",
+#			9, "signal(inner6)", 10, "signal(inner7)", 11, "mask(bottom pad/via/smd)", 12, "silk(bottom)", 
+#			13, "SMD(stencil top)", 14, "SMD(stencil bottom)", 15, "Assist Offset, 50, "drillplan");
+#
+##############################################################################################
+sub GuessName
+{
+	my $info = "unknown";
+
+# signal layers
+	if ($plstracelayers != 0)
+	{
+		$info = $layers2names{$ublayer2stack{$plstracelayers}};         # direct conversion
+	}
+# silk and
+	elsif ($plspadlayers != 0)
+	{
+# masks
+		if ($plspadlayers == 1) # top
+		{
+			# detect "assist file", pads_drilled/vias/drilled_holes
+			if(($via_value == 1) && ($pdr_value == 1) && ($drh_value == 1))
+			{
+				return $info;
+			}
+			# mask all, 
+			elsif(($via_value == 1) || ($pdr_value == 1))
+			{
+				$info = $layers2names{2};
+			}
+			# stencil
+			elsif ((($via_value == 0) || ($pdr_value == 0)) && ($smd_value == 1))
+			{
+				$info = $layers2names{13};
+			}
+			# silk
+			elsif(($sst_value == 1)|| ($gst_value == 1))
+			{
+				$info = $layers2names{1};
+			}
+		}
+		elsif ($plspadlayers == 2) # bottom
+		{
+			# mask all
+			if(($via_value == 1) || ($pdr_value == 1))
+			{
+				$info = $layers2names{11};		
+			}
+			# stencil
+			elsif ((($via_value == 0) || ($pdr_value == 0)) && ($smd_value == 1))
+			{
+				$info = $layers2names{14};
+			}
+			# silk
+			elsif (($sbt_value == 1) || ($sbb_value == 1))
+			{
+				$info = $layers2names{12};
+			}
+		}
+	}
+	return $info;	
+}
+
+##############################################################################################
+sub ProcessUltiset
+{
+}
+
+
+##############################################################################################
+#
+#   	print OUTPUT "M72\n";			# INCH  M71 is METRIC of INCH, LZ  / METRIC, LZ
+#
+# we don't convert the .D0 file, as the units are choosen at ultipost drill settings time .DRS
+#
+##############################################################################################
+sub DoExcellon
+{
+	my $index;
+	my $count;
+	my $regel;
+    my $save_i_integers = $i_integers;
+    my $save_i_decimals = $i_decimals;
+    my $save_f_integers = $f_integers;
+    my $units = 1.0;
+    
+   	print OUTPUT "%\n";
+   	print OUTPUT "M48\n";			# start of header
+   	if(index ($e_drillunits, "INCH") >= 0)
+	{
+        $units = 0.1;	###!!! was 1.0, gaf fouten met galblast (inch drill)
+        $f_integers = 2;
+		print OUTPUT "M72\n";
+# output format
+	}	
+   	elsif($e_drillunits eq "METRIC")
+	{
+        $f_integers = 3;
+        $units = 1.0;
+		print OUTPUT "M71\n";
+# output format
+	}
+	else 
+	{
+            print "*** diaster!, no units specified in drill file (.REP)\n";
+        }            
+    #
+    # we change the formatting parameters and restore them later
+    #
+	$i_integers = $e_integers;
+	$i_decimals = $e_decimals;
+    $xoffset_vector = 0;
+    $yoffset_vector = 0;
+
+	$count = keys %drilltools;
+	for ($i = 1; $i <= $count; $i++)
+	{
+		printf OUTPUT "T%02DC%.4f\n", $i, $drilltools{$i} * 1.0;
+	}
+
+   	print OUTPUT "%\n";
+   	print OUTPUT "G05\n";			# drill mode
+   	print OUTPUT "G90\n";			# absolute mode
+
+    while(<INPUT>)
+    {
+        chomp;
+		$_ =~ s/[\x00-\x1f]//g;  # strip control characters
+
+		$regel = &ProcessVectorLine($_, $units, 0);
+       	print OUTPUT $regel."\n"; 
+    }
+    #
+    $f_integers = $save_f_integers;
+    $i_integers = $save_i_integers;
+    $i_decimals = $save_i_decimals;
+}
+
+##############################################################################################
+#
+# transfer both items into same format first
+# .PLS file line already parsed
+#
+# as the gerbers have been offsetted to allow center marks to be plotted too we need to undo that
+#
+# find the hole/drillmark with the highest X/Y value in the .D0 and the .DX file (offset)
+# they should refer to the SAME spot
+# thus, if we note the coordinates in both files, it gives us the offset
+# and differences we need to shift the gerbers back over the drill info
+#
+##############################################################################################
+sub CalculateOffset()
+{
+	my $index = $_[0];		                                            # keep for later
+	my $save_i_integers = $i_integers;                                  # we will change them local
+	my $save_i_decimals = $i_decimals;
+	my $units = 1.0;                                                    # gerber is in INCH format
+	my $returnline;
+    my $xval1;
+    my $yval1;
+    my $xval2;
+    my $yval2;
+#
+# read .GX file first, in NNDDD INCH format, update ..offset_max values
+#
+# where with 2layer this is: .G8, 4layer is .G10, 8layer is .G14
+#
+    # scan file for first X/Y vector
+    $gerberin = sprintf "%s.%s%d", $opt_f, ($fileupper == 1) ? "G" : "g", $index;
+    open(INPUT,  "$gerberin") || die "can't open gerber file $gerberin !\n";
+# find X max first
+    while(<INPUT>) {
+        chomp;
+		$_ =~ s/[\x00-\x1f]//g;  # strip control characters
+        $returnline = &ProcessVectorLine($_, $units, 1);                # updates X ...offset_max
+    }
+	seek (INPUT ,0 ,0);
+# find Y max @ X max next
+    while(<INPUT>) {
+        chomp;
+		$_ =~ s/[\x00-\x1f]//g;  # strip control characters
+        $returnline = &ProcessVectorLine($_, $units, 2);                # updates Y ...offset_max
+    }
+# now in NNNDDD format
+    close INPUT;
+    
+    $xval1 = $xoffset_max;
+    $yval1 = $yoffset_max;
+    # reset limits
+    $xoffset_max = 0.0;
+    $yoffset_max = 0.0;
+#
+# now read D0 file, in NNNDDD (.rep) format, read the drill coordinates
+#
+    if(index ($e_drillunits, "INCH") >= 0)
+    {
+		$units = 1.0;
+    }   
+    if($e_drillunits eq "METRIC")
+    {
+		$units = 25.4;
+    }
+	$i_integers = $e_integers;
+	$i_decimals = $e_decimals;
+    #
+	$gerberin = sprintf "%s.%s", $opt_f, ($fileupper == 1) ? "D0" : "d0";
+    open(INPUT,  "$gerberin") || die "can't open gerber file $gerberin !\n";
+# find X max first
+    while(<INPUT>) {
+        chomp;
+		$_ =~ s/[\x00-\x1f]//g;  # strip control characters
+       	$returnline = &ProcessVectorLine($_, $units, 1);                # apply units correction, updates X ...offset_max
+    }
+	seek (INPUT, 0, 0);
+# find Y max @ X max next
+    while(<INPUT>) {
+        chomp;
+		$_ =~ s/[\x00-\x1f]//g;  # strip control characters
+       	$returnline = &ProcessVectorLine($_, $units, 2);                # apply units correction, updates  Y ...offset_max
+    }
+    close INPUT;
+#
+# we have two X.Y coordinates at the upper-right, one for the gerber and one for the drill info
+# subtract these two and we have an offset. Now add this offset to each vector in the
+# drill file so that the gerbers AND the drill file end up at the same location :-)
+#
+    $xval2 = $xoffset_max;
+    $yval2 = $yoffset_max;
+print "x1: $xval1, y1: $yval1, x2: $xval2, y2: $yval2 \n";
+    #
+    if ($opt_d == 0)
+    {
+        $xoffset_gerber = -($xval1 - $xval2);                               # set offset values
+        $yoffset_gerber = -($yval1 - $yval2);
+		print "xof: $xoffset_gerber, yof: $yoffset_gerber \n";
+	}
+	if ((($xval1 > 4.0) || ($yval1 > 4.0)) && 
+	 	(($e_drillunits eq "METRIC") && ($e_integers < 3)))
+	{
+		print "**WARNING: drill coordinates exceed 4.0 inch, use other drill settings for UltiPost! \n";
+	}
+
+    # restore original values
+	$i_decimals	= $save_i_decimals;
+	$i_integers = $save_i_integers;
+}
+
