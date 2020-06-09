@@ -1,0 +1,8 @@
+#!/bin/sh
+
+echo "call xrun" >~/ulti.bat
+echo "exit" >>~/ulti.bat
+
+dosbox -c "call f:ulti.bat" 
+
+rm ~/ulti.bat
